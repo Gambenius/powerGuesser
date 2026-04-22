@@ -5,7 +5,7 @@ from src.physics import CyclingPhysics
 
 # --- CONFIGURATION ---
 MY_MASS = 85        # kg (Rider + Bike + Gear)
-MY_CDA = 0.32       # Aerodynamic drag coefficient
+MY_CDA = 0.25       # Aerodynamic drag coefficient
 MY_CRR = 0.005      # Rolling resistance coefficient
 FIT_FILE = "data/canyon1.fit"
 
@@ -21,45 +21,39 @@ def main():
         print("❌ Error: No data found in FIT file.")
         return
 
-    # Force index cleanup one last time
+    # Cleanup index
     df = df.loc[~df.index.duplicated(keep='first')].copy()
     df = df.reset_index(drop=True)
 
     print(f"📊 Loaded {len(df)} data points.")
     
+    # --- ELEVATION SMOOTHING ---
+    # GPS elevation is noisy. We smooth it over a 5-second window to fix the "spikes"
+    df['ele_smoothed'] = df['ele'].rolling(window=5, min_periods=1, center=True).mean()
+
     # Initialize Physics Engine
     physics = CyclingPhysics(MY_MASS, MY_CDA, MY_CRR)
 
     print("⚡ Calculating physics vectors...")
     
-    # Extract NumPy arrays to bypass Pandas alignment issues
     speed_array = df['speed'].values
     dt_array = df['dt'].values
-    ele_array = df['ele'].values
-    
-    # Use cadence if available, otherwise assume pedaling
+    ele_array = df['ele_smoothed'].values # Using smoothed elevation
     cadence_array = df['cad'].values if 'cad' in df.columns else np.ones(len(df)) * 90
 
-    # 1. Calculate Elevation Delta (Vertical Velocity)
+    # 1. Calculate Elevation and Grade
     ele_diff = np.diff(ele_array, prepend=ele_array[0])
-    
-    # 2. Calculate Distance Delta (Horizontal Velocity)
     dist_diff = speed_array * dt_array
     
-    # 3. Calculate Grade (Slope)
-    # Using atan2 or simple rise/run. Rise/run is fine for cycling grades.
     grade = np.zeros_like(dist_diff)
-    safe_mask = dist_diff > 0.1  # Only calc grade if we moved > 10cm
+    safe_mask = dist_diff > 0.1
     grade[safe_mask] = ele_diff[safe_mask] / dist_diff[safe_mask]
-    
-    # Clip grade to realistic limits (+/- 25%) to filter GPS noise
     df['grade'] = np.clip(grade, -0.25, 0.25)
 
     print("🚴‍♂️ Simulating power output...")
-    powers = [0.0] # First point power is 0
+    powers = [0.0]
 
     for i in range(1, len(df)):
-        # If cadence is 0, power is 0 (coasting)
         if cadence_array[i] <= 0:
             p = 0.0
         else:
@@ -73,19 +67,36 @@ def main():
 
     df['calculated_power'] = powers
 
-    # --- RESULTS ---
-    avg_p = df['calculated_power'].mean()
-    max_p = df['calculated_power'].max()
+    # --- POWER PERCENTILES (POWER CURVE) ---
+    percentiles = [25, 50, 75, 90, 95, 99]
     
-    print("-" * 30)
-    print(f"✅ CALCULATION COMPLETE")
-    print(f"⏱️ Ride Duration: {df['dt'].sum() / 60:.1f} minutes")
-    print(f"🚵 Average Power: {avg_p:.2f} W")
-    print(f"🚀 Max Power:     {max_p:.2f} W")
-    print("-" * 30)
-
-    # Optional: Save a CSV for a quick vibe check in Excel/Sheets
-    # df.to_csv("data/processed_ride.csv", index=False)
+    print("-" * 45)
+    print(f"{'Metric':<15} | {'Real (W)':<10} | {'Guessed (W)':<12}")
+    print("-" * 45)
+    
+    avg_calc = df['calculated_power'].mean()
+    if 'real_power' in df.columns:
+        avg_real = df['real_power'].mean()
+        print(f"{'Average':<15} | {avg_real:<10.2f} | {avg_calc:<12.2f}")
+        for p in percentiles:
+            val_real = np.percentile(df['real_power'], p)
+            val_calc = np.percentile(df['calculated_power'], p)
+            print(f"{str(p) + 'th %':<15} | {val_real:<10.2f} | {val_calc:<12.2f}")
+    else:
+        print(f"{'Average':<15} | {'N/A':<10} | {avg_calc:<12.2f}")
+        for p in percentiles:
+            val_calc = np.percentile(df['calculated_power'], p)
+            print(f"{str(p) + 'th %':<15} | {'N/A':<10} | {val_calc:<12.2f}")
+            
+    print("-" * 45)
+    
+    if 'real_power' in df.columns:
+        diff = ((avg_calc - avg_real) / avg_real) * 100 if avg_real > 0 else 0
+        print(f"⚖️ Overall Bias: {diff:+.1f}%")
+        if diff > 10:
+            print("💡 Suggestion: Lower your MY_CDA or check your total weight.")
+        elif diff < -10:
+            print("💡 Suggestion: Increase your MY_CDA (too much aero?)")
 
 if __name__ == "__main__":
     main()
