@@ -1,102 +1,102 @@
+import streamlit as st
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import xml.etree.ElementTree as ET
 from src.processor import parse_fit_file
 from src.physics import CyclingPhysics
 
-# --- CONFIGURATION ---
-MY_MASS = 85        # kg (Rider + Bike + Gear)
-MY_CDA = 0.25       # Aerodynamic drag coefficient
-MY_CRR = 0.005      # Rolling resistance coefficient
-FIT_FILE = "data/canyon1.fit"
+# --- STREAMLIT UI SETUP ---
+st.set_page_config(page_title="Pywermeter.py", page_icon="🚴")
+st.title("🚴 Pywermeter.py")
+st.markdown("Upload a .fit file to calculate physics-based power and export to GPX.")
 
-def main():
-    print(f"🚀 Loading FIT file: {FIT_FILE}")
-    try:
-        df = parse_fit_file(FIT_FILE)
-    except Exception as e:
-        print(f"❌ Failed to parse FIT file: {e}")
-        return
+# Sidebar Configuration
+st.sidebar.header("Settings")
+my_mass = st.sidebar.number_input("Total Mass (kg)", value=73, help="Rider + Bike + Gear")
+my_cda = st.sidebar.slider("CdA (Aero)", 0.20, 0.45, 0.29, step=0.01)
+my_crr = st.sidebar.slider("Crr (Rolling)", 0.001, 0.010, 0.005, step=0.001)
+smoothing_m = st.sidebar.slider("Elevation Smooth (meters)", 5, 50, 20)
+speed_smooth_s = st.sidebar.slider("Speed Smooth (seconds)", 1, 10, 5)
 
-    if df.empty:
-        print("❌ Error: No data found in FIT file.")
-        return
+uploaded_file = st.file_uploader("Choose a FIT file", type="fit")
 
-    # Cleanup index
-    df = df.loc[~df.index.duplicated(keep='first')].copy()
-    df = df.reset_index(drop=True)
-
-    print(f"📊 Loaded {len(df)} data points.")
+def save_to_gpx_string(df):
+    """Generates GPX XML and returns it as a string for downloading."""
+    ET.register_namespace('', "http://www.topografix.com/GPX/1/1")
+    ET.register_namespace('gpxtpx', "http://www.garmin.com/xmlschemas/TrackPointExtension/v1")
     
-    # --- ELEVATION SMOOTHING ---
-    # GPS elevation is noisy. We smooth it over a 5-second window to fix the "spikes"
-    df['ele_smoothed'] = df['ele'].rolling(window=5, min_periods=1, center=True).mean()
+    gpx = ET.Element("gpx", {
+        "version": "1.1", "creator": "Pywermeter.py",
+        "xmlns": "http://www.topografix.com/GPX/1/1",
+        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance"
+    })
+    trk = ET.SubElement(gpx, "trk")
+    trkseg = ET.SubElement(trk, "trkseg")
 
-    # Initialize Physics Engine
-    physics = CyclingPhysics(MY_MASS, MY_CDA, MY_CRR)
+    for _, row in df.iterrows():
+        trkpt = ET.SubElement(trkseg, "trkpt", {"lat": f"{row['lat']:.7f}", "lon": f"{row['lon']:.7f}"})
+        ET.SubElement(trkpt, "ele").text = f"{row['ele_smoothed']:.2f}"
+        ET.SubElement(trkpt, "time").text = row['time'].strftime('%Y-%m-%dT%H:%M:%SZ')
+        
+        extensions = ET.SubElement(trkpt, "extensions")
+        ET.SubElement(extensions, "power").text = str(int(row['p_guessed']))
+        
+        tpe = ET.SubElement(extensions, "{http://www.garmin.com/xmlschemas/TrackPointExtension/v1}TrackPointExtension")
+        if 'hr' in row and not pd.isna(row['hr']):
+            ET.SubElement(tpe, "{http://www.garmin.com/xmlschemas/TrackPointExtension/v1}hr").text = str(int(row['hr']))
+        if 'cad' in row and not pd.isna(row['cad']):
+            ET.SubElement(tpe, "{http://www.garmin.com/xmlschemas/TrackPointExtension/v1}cad").text = str(int(row['cad']))
 
-    print("⚡ Calculating physics vectors...")
+    return ET.tostring(gpx, encoding='unicode', method='xml')
+
+if uploaded_file is not None:
+    # Save temp file for processor
+    with open("temp.fit", "wb") as f:
+        f.write(uploaded_file.getbuffer())
     
-    speed_array = df['speed'].values
-    dt_array = df['dt'].values
-    ele_array = df['ele_smoothed'].values # Using smoothed elevation
-    cadence_array = df['cad'].values if 'cad' in df.columns else np.ones(len(df)) * 90
+    df = parse_fit_file("temp.fit")
 
-    # 1. Calculate Elevation and Grade
+    # 1. Smoothing
+    df['speed_smoothed'] = df['speed'].rolling(window=speed_smooth_s, center=True, min_periods=1).mean()
+    avg_speed = df['speed_smoothed'].mean() if df['speed_smoothed'].mean() > 0 else 5
+    rows_in_window = max(int(smoothing_m / avg_speed), 5) 
+    df['ele_smoothed'] = df['ele'].rolling(window=rows_in_window, center=True, min_periods=1).mean()
+
+    # 2. Physics
+    physics = CyclingPhysics(my_mass, my_cda, my_crr)
+    v = df['speed_smoothed'].values
+    ele_array = df['ele_smoothed'].values
+    dt = df['dt'].values
+    cadence = df['cad'].values if 'cad' in df.columns else np.ones(len(df)) * 90
+    
     ele_diff = np.diff(ele_array, prepend=ele_array[0])
-    dist_diff = speed_array * dt_array
+    grade = np.zeros_like(v)
+    safe_mask = (v * dt) > 0.1
+    grade[safe_mask] = ele_diff[safe_mask] / (v[safe_mask] * dt[safe_mask])
     
-    grade = np.zeros_like(dist_diff)
-    safe_mask = dist_diff > 0.1
-    grade[safe_mask] = ele_diff[safe_mask] / dist_diff[safe_mask]
-    df['grade'] = np.clip(grade, -0.25, 0.25)
-
-    print("🚴‍♂️ Simulating power output...")
-    powers = [0.0]
-
-    for i in range(1, len(df)):
-        if cadence_array[i] <= 0:
-            p = 0.0
+    powers = []
+    for i in range(len(df)):
+        if i == 0 or cadence[i] <= 0:
+            powers.append(0.0)
         else:
-            p = physics.calculate_power(
-                v_m_s = speed_array[i],
-                v_prev = speed_array[i-1],
-                grade = df['grade'].iloc[i],
-                dt = dt_array[i]
-            )
-        powers.append(p)
-
-    df['calculated_power'] = powers
-
-    # --- POWER PERCENTILES (POWER CURVE) ---
-    percentiles = [25, 50, 75, 90, 95, 99]
+            p = physics.calculate_power(v[i], v[i-1], grade[i], dt[i])
+            powers.append(max(0, p))
     
-    print("-" * 45)
-    print(f"{'Metric':<15} | {'Real (W)':<10} | {'Guessed (W)':<12}")
-    print("-" * 45)
-    
-    avg_calc = df['calculated_power'].mean()
-    if 'real_power' in df.columns:
-        avg_real = df['real_power'].mean()
-        print(f"{'Average':<15} | {avg_real:<10.2f} | {avg_calc:<12.2f}")
-        for p in percentiles:
-            val_real = np.percentile(df['real_power'], p)
-            val_calc = np.percentile(df['calculated_power'], p)
-            print(f"{str(p) + 'th %':<15} | {val_real:<10.2f} | {val_calc:<12.2f}")
-    else:
-        print(f"{'Average':<15} | {'N/A':<10} | {avg_calc:<12.2f}")
-        for p in percentiles:
-            val_calc = np.percentile(df['calculated_power'], p)
-            print(f"{str(p) + 'th %':<15} | {'N/A':<10} | {val_calc:<12.2f}")
-            
-    print("-" * 45)
-    
-    if 'real_power' in df.columns:
-        diff = ((avg_calc - avg_real) / avg_real) * 100 if avg_real > 0 else 0
-        print(f"⚖️ Overall Bias: {diff:+.1f}%")
-        if diff > 10:
-            print("💡 Suggestion: Lower your MY_CDA or check your total weight.")
-        elif diff < -10:
-            print("💡 Suggestion: Increase your MY_CDA (too much aero?)")
+    df['p_guessed'] = powers
 
-if __name__ == "__main__":
-    main()
+    # 3. Visuals
+    st.subheader("Power Profile (30s Moving Average)")
+    p_chart = df['p_guessed'].rolling(30, center=True).mean()
+    st.line_chart(p_chart)
+
+    # 4. Download
+    gpx_str = save_to_strava_gpx_string(df)
+    st.download_button(
+        label="📩 Download GPX for Strava",
+        data=gpx_str,
+        file_name=f"{uploaded_file.name.split('.')[0]}_with_power.gpx",
+        mime="application/gpx+xml"
+    )
+    
+    st.success(f"Processed {len(df)} points. Average Power: {df['p_guessed'].mean():.1f}W")
