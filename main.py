@@ -85,12 +85,28 @@ if uploaded_file is not None:
 
     # 5. VISUALS (X-axis as Distance)
     st.subheader("Power Profile")
-    p_smoothed = df['p_guessed'].rolling(30, center=True).mean()
-    chart_data = pd.DataFrame({
+
+    # Prepare the Plotting DataFrame
+    plot_df = pd.DataFrame({
         'Distance (km)': df['cum_dist_km'],
-        'Power (W)': p_smoothed
-    }).set_index('Distance (km)')
-    st.line_chart(chart_data)
+        'Estimated Power': df['p_guessed'].rolling(30, center=True).mean()
+    })
+
+    # Check for existing power and add to DF if found
+    has_real_power = 'power' in df.columns and df['power'].sum() > 0
+    
+    if has_real_power:
+        plot_df['Original Power'] = df['power'].rolling(30, center=True).mean()
+        
+        # Streamlit's native chart with custom color mapping
+        st.line_chart(
+            plot_df.set_index('Distance (km)'),
+            color=["#0000FF", "#FF0000"]  # Blue for Estimated, Red for Original
+        )
+        st.info("🔴 Red: Original Power | 🔵 Blue: Pywermeter Estimate")
+    else:
+        st.line_chart(plot_df.set_index('Distance (km)'))
+        st.warning("No original power data found in file. Showing estimate only.")
 
     # 6. DOWNLOAD
     gpx_str = save_to_strava_gpx_string(df)
