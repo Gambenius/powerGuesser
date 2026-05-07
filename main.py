@@ -78,10 +78,16 @@ if uploaded_file is not None:
     df['p_guessed'] = powers
 
     # 4. DASHBOARD METRICS
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Avg Power", f"{df['p_guessed'].mean():.0f} W")
-    col2.metric("Distance", f"{df['cum_dist_km'].max():.2f} km")
-    col3.metric("Elevation Gain", f"{max(0, ele_diff[ele_diff > 0].sum()):.0f} m")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Estimated Avg", f"{df['p_guessed'].mean():.0f} W")
+    
+    if has_real_power:
+        col2.metric("Real Avg", f"{df['power'].mean():.0f} W", delta=f"{df['p_guessed'].mean() - df['power'].mean():.1f} W diff")
+    else:
+        col2.metric("No powermeter detected", "")
+        
+    col3.metric("Distance", f"{df['cum_dist_km'].max():.2f} km")
+    col4.metric("Elevation Gain", f"{max(0, ele_diff[ele_diff > 0].sum()):.0f} m")
 
     # 5. VISUALS (X-axis as Distance)
     st.subheader("Power Profile")
