@@ -44,6 +44,17 @@ if uploaded_file is not None:
         f.write(uploaded_file.getbuffer())
     
     df = parse_fit_file("temp.fit")
+    # --- DEBUG SECTION ---
+    with st.expander("🔍 Inspect FIT File Channels (Columns)"):
+        st.write(f"**Found {len(df.columns)} channels:**")
+        st.write(list(df.columns))
+        st.write("**Data Preview (First 5 rows):**")
+        st.dataframe(df.head())
+    # ---------------------
+    # --- DEFINE THIS EARLY AND SAFELY ---
+    # We check if 'power' is a column AND if it contains any non-zero/non-null data
+    has_real_power = 'real_power' in df.columns and df['real_power'].notnull().any() and df['real_power'].sum() > 0
+    # ------------------------------------
 
     # 1. CORE DATA CALCULATIONS (Fixes the KeyError)
     df['speed_smoothed'] = df['speed'].rolling(window=speed_smooth_s, center=True, min_periods=1).mean()
@@ -79,40 +90,56 @@ if uploaded_file is not None:
 
     # 4. DASHBOARD METRICS
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Estimated Avg", f"{df['p_guessed'].mean():.0f} W")
+    
+    # Calculate averages safely
+    avg_guessed = df['p_guessed'].mean()
+    col1.metric("Estimated Avg", f"{avg_guessed:.0f} W")
     
     if has_real_power:
-        col2.metric("Real Avg", f"{df['power'].mean():.0f} W", delta=f"{df['p_guessed'].mean() - df['power'].mean():.1f} W diff")
-    else:
-        col2.metric("No powermeter detected", "")
+        # Using .mean() on real_power automatically ignores NaNs (missing data)
+        avg_real = df['real_power'].mean()
+        diff = avg_guessed - avg_real
         
+        col2.metric(
+            label="Real Avg", 
+            value=f"{avg_real:.0f} W", 
+            delta=f"{diff:+.1f} W (Error)", # Shows + or - sign
+            delta_color="inverse" # Optional: Makes the delta RED if positive (overestimating)
+        )
+    else:
+        col2.metric("Real Avg", "N/A")
+
+    # Keep your distance and elevation metrics
     col3.metric("Distance", f"{df['cum_dist_km'].max():.2f} km")
     col4.metric("Elevation Gain", f"{max(0, ele_diff[ele_diff > 0].sum()):.0f} m")
 
-    # 5. VISUALS (X-axis as Distance)
+    # 5. VISUALS
     st.subheader("Power Profile")
 
-    # Prepare the Plotting DataFrame
-    plot_df = pd.DataFrame({
-        'Distance (km)': df['cum_dist_km'],
-        'Estimated Power': df['p_guessed'].rolling(30, center=True).mean()
-    })
+    # --- SAMPLING LOGIC ---
+    # Define your sample rate (e.g., 5 means taking 1 point every 5 seconds)
+    # Automatically adjust sample rate so we never plot more than 2000 points
+    total_rows = len(df)
+    sample_rate = max(1, total_rows // 400)    
+    # Create the dictionary using a sliced DataFrame [::sample_rate]
+    chart_dict = {
+        'Distance (km)': df['cum_dist_km'][::sample_rate],
+        'Estimated Power (W)': df['p_guessed'].rolling(30, center=True).mean()[::sample_rate]
+    }
 
-    # Check for existing power and add to DF if found
-    has_real_power = 'power' in df.columns and df['power'].sum() > 0
-    
     if has_real_power:
-        plot_df['Original Power'] = df['power'].rolling(30, center=True).mean()
-        
-        # Streamlit's native chart with custom color mapping
-        st.line_chart(
-            plot_df.set_index('Distance (km)'),
-            color=["#0000FF", "#FF0000"]  # Blue for Estimated, Red for Original
-        )
-        st.info("🔴 Red: Original Power | 🔵 Blue: Pywermeter Estimate")
-    else:
-        st.line_chart(plot_df.set_index('Distance (km)'))
-        st.warning("No original power data found in file. Showing estimate only.")
+        # Use the same slice to keep the indices aligned
+        chart_dict['Original Power (W)'] = df['real_power'].rolling(30, center=True).mean()[::sample_rate]
+
+    plot_df = pd.DataFrame(chart_dict).set_index('Distance (km)')
+
+    # Chart Colors: Estimated (Blue), Original (Red)
+    chart_colors = ["#0000FF", "#FF0000"] if has_real_power else ["#0000FF"]
+    
+    st.line_chart(plot_df, color=chart_colors)
+
+    if has_real_power:
+        st.info(f"🔴 **Red**: Original | 🔵 **Blue**: Estimate (Downsampled to 1/{sample_rate} points)")
 
     # 6. DOWNLOAD
     gpx_str = save_to_strava_gpx_string(df)
