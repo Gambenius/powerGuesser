@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import xml.etree.ElementTree as ET
 from src.processor import parse_fit_file
 from src.physics import CyclingPhysics
+from src.fit_exporter import save_fit_bytes_simple
 
 # --- STREAMLIT UI SETUP ---
 st.set_page_config(page_title="Pywermeter", page_icon="🚴", layout="wide")
@@ -141,11 +142,31 @@ if uploaded_file is not None:
     if has_real_power:
         st.info(f"🔴 **Red**: Original | 🔵 **Blue**: Estimate (Downsampled to 1/{sample_rate} points)")
 
-    # 6. DOWNLOAD
-    gpx_str = save_to_strava_gpx_string(df)
-    st.download_button(
-        label="📩 Download GPX for Strava",
-        data=gpx_str,
-        file_name=f"{uploaded_file.name.split('.')[0]}_fixed.gpx",
-        mime="application/gpx+xml"
-    )
+    # 6. DOWNLOAD SECTION
+    st.subheader("📥 Download Results")
+    
+    col_gpx, col_fit = st.columns(2)
+    
+    with col_gpx:
+        # GPX Download Button
+        gpx_str = save_to_strava_gpx_string(df)
+        st.download_button(
+            label="📩 Download GPX for Strava",
+            data=gpx_str,
+            file_name=f"{uploaded_file.name.split('.')[0]}_fixed.gpx",
+            mime="application/gpx+xml"
+        )
+    
+    with col_fit:
+        # FIT Download Button with processed power data
+        try:
+            fit_bytes = save_fit_bytes_simple("temp.fit", df)
+            st.download_button(
+                label="💾 Download Processed FIT File",
+                data=fit_bytes,
+                file_name=f"{uploaded_file.name.split('.')[0]}_processed.fit",
+                mime="application/octet-stream"
+            )
+        except Exception as e:
+            st.error(f"⚠️ Error generating FIT file: {str(e)}")
+            st.info("You can still download the GPX file above.")
