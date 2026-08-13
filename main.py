@@ -79,16 +79,22 @@ if uploaded_file is not None:
     safe_mask = (v * dt) > 0.1
     grade[safe_mask] = ele_diff[safe_mask] / (v[safe_mask] * dt[safe_mask])
     
-    powers = []
-    for i in range(len(df)):
-        if i == 0 or cadence[i] <= 0:
-            powers.append(0.0)
-        else:
-            p = physics.calculate_power(v[i], v[i-1], grade[i], dt[i])
-            powers.append(max(0.0, p))
-    
-    df['p_guessed'] = powers
+    powers = [float('nan')]  # row 0 has no previous sample
 
+    for i in range(1, len(df)):
+        p = physics.calculate_power(
+            v_m_s      = df['speed'].iloc[i] / 3.6,
+            v_prev_m_s = df['speed'].iloc[i-1] / 3.6,
+            ele_m      = df['ele'].iloc[i],
+            ele_prev_m = df['ele'].iloc[i-1],
+            dt         = df['dt'].iloc[i],
+            temp_c     = df['temp'].iloc[i] if not pd.isna(df['temp'].iloc[i]) else 20.0,
+        )
+        powers.append(p)  # ← this line was missing
+
+    df['p_guessed'] = powers
+    # Fill NaNs with 0 and ensure integer type for FIT export
+    df['p_guessed'] = df['p_guessed'].fillna(0).clip(lower=0).astype(int)
     # 4. DASHBOARD METRICS
     col1, col2, col3, col4 = st.columns(4)
     
