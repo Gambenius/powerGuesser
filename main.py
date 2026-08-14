@@ -83,10 +83,10 @@ if uploaded_file is not None:
 
     for i in range(1, len(df)):
         p = physics.calculate_power(
-            v_m_s      = df['speed'].iloc[i] / 3.6,
-            v_prev_m_s = df['speed'].iloc[i-1] / 3.6,
-            ele_m      = df['ele'].iloc[i],
-            ele_prev_m = df['ele'].iloc[i-1],
+            v_m_s      = df['speed_smoothed'].iloc[i] / 3.6,
+            v_prev_m_s = df['speed_smoothed'].iloc[i-1] / 3.6,
+            ele_m      = df['ele_smoothed'].iloc[i],
+            ele_prev_m = df['ele_smoothed'].iloc[i-1],
             dt         = df['dt'].iloc[i],
             temp_c     = df['temp'].iloc[i] if not pd.isna(df['temp'].iloc[i]) else 20.0,
         )
