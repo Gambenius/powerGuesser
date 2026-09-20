@@ -49,23 +49,27 @@ def find_long_climbs(df, minimum_grade=0.03, minimum_distance_m=1000, max_power_
     index = 0
 
     while index < len(df) - 1:
-        end = int(np.searchsorted(distance, distance[index] + minimum_distance_m))
-        if end >= len(df):
-            break
-        grade = (elevation[end] - elevation[index]) / max(distance[end] - distance[index], 1)
-        if grade < minimum_grade:
+        candidate_end = index + 1
+        non_climb_distance = 0.0
+        while candidate_end < len(df):
+            step_distance = max(0.0, distance[candidate_end] - distance[candidate_end - 1])
+            elevation_change = elevation[candidate_end] - elevation[candidate_end - 1]
+            if elevation_change < -0.5:
+                non_climb_distance += step_distance
+            else:
+                non_climb_distance = 0.0
+            if non_climb_distance > 100:
+                candidate_end = max(index + 1, candidate_end - 1)
+                break
+            candidate_end += 1
+        else:
+            candidate_end = len(df) - 1
+
+        total_distance = distance[candidate_end] - distance[index]
+        grade = (elevation[candidate_end] - elevation[index]) / max(total_distance, 1)
+        if total_distance < minimum_distance_m or grade < minimum_grade:
             index += 1
             continue
-
-        candidate_end = end
-        while candidate_end + 1 < len(df):
-            next_end = int(np.searchsorted(distance, distance[index] + (distance[candidate_end] - distance[index]) + 100))
-            if next_end >= len(df):
-                break
-            rolling_grade = (elevation[next_end] - elevation[index]) / max(distance[next_end] - distance[index], 1)
-            if rolling_grade < minimum_grade:
-                break
-            candidate_end = next_end
 
         segment_power = power[index:candidate_end + 1]
         average_power = float(np.mean(segment_power))
@@ -74,8 +78,8 @@ def find_long_climbs(df, minimum_grade=0.03, minimum_distance_m=1000, max_power_
             climbs.append({
                 'start_index': index,
                 'end_index': candidate_end,
-                'distance_km': (distance[candidate_end] - distance[index]) / 1000,
-                'grade': (elevation[candidate_end] - elevation[index]) / max(distance[candidate_end] - distance[index], 1),
+                'distance_km': total_distance / 1000,
+                'grade': grade,
                 'average_power': round(average_power),
             })
             index = candidate_end + 1
@@ -332,7 +336,8 @@ if uploaded_file is not None:
 
     st.subheader("Time in Power Zones")
     zone_numbers = np.digitize(df['p_guessed'].to_numpy(), zone_limits[1:-1], right=False) + 1
-    zone_seconds = np.bincount(zone_numbers - 1, weights=dt, minlength=7)
+    active_seconds = np.where(dt <= 5, dt, 0)
+    zone_seconds = np.bincount(zone_numbers - 1, weights=active_seconds, minlength=7)
     zone_labels = [f"Z{zone}" for zone in range(1, 8)]
     zone_colors = ['#2E86DE', '#2ECC71', '#F1C40F', '#F39C12', '#E74C3C', '#8E44AD', '#922B21']
 
