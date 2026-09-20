@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pydeck as pdk
 import tempfile
-from src.processor import parse_fit_file, write_power_fit
+from src.processor import parse_fit_file, write_power_fit, prepare_activity
 from src.physics import CyclingPhysics, lowpass_power, optimize_parameters
 
 
@@ -20,7 +20,8 @@ my_crr = st.sidebar.slider("Crr (Rolling)", 0.000, 0.015, 0.005, step=0.0005, fo
 smoothing_m = st.sidebar.slider("Elevation Smooth (meters)", 5, 50, 20)
 speed_smooth_s = st.sidebar.slider("Speed Smooth (seconds)", 1, 10, 5)
 ftp = st.sidebar.slider("FTP (W)", 50, 500, 220, step=1)
-optimize_clicked = st.sidebar.button("Optimize from real power")
+optimize_clicked = st.sidebar.button("Optimize CdA from real power")
+st.sidebar.caption('Calibration fixes Crr at 0.003 and keeps your mass fixed.')
 
 
 @st.cache_data(max_entries=4, show_spinner=False)
@@ -29,6 +30,11 @@ def read_upload(contents):
         source.write(contents)
         source.flush()
         return parse_fit_file(source.name)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def process_upload(contents, elevation_window, speed_window):
+    return prepare_activity(read_upload(contents), elevation_window, speed_window)
 
 
 @st.cache_data(max_entries=4, show_spinner=False)
@@ -46,52 +52,53 @@ def find_long_climbs(df, minimum_grade=0.03, minimum_distance_m=1000, max_power_
     distance = df['cum_dist_km'].to_numpy() * 1000
     elevation = df['ele_smoothed'].to_numpy()
     power = df['p_guessed'].to_numpy()
-    index = 0
+    start = None
+    last_up = 0
 
-    while index < len(df) - 1:
-        candidate_end = index + 1
-        non_climb_distance = 0.0
-        while candidate_end < len(df):
-            step_distance = max(0.0, distance[candidate_end] - distance[candidate_end - 1])
-            elevation_change = elevation[candidate_end] - elevation[candidate_end - 1]
-            if elevation_change < -0.5:
-                non_climb_distance += step_distance
-            else:
-                non_climb_distance = 0.0
-            if non_climb_distance > 100:
-                candidate_end = max(index + 1, candidate_end - 1)
-                break
-            candidate_end += 1
-        else:
-            candidate_end = len(df) - 1
-
-        total_distance = distance[candidate_end] - distance[index]
-        grade = (elevation[candidate_end] - elevation[index]) / max(total_distance, 1)
-        if total_distance < minimum_distance_m or grade < minimum_grade:
-            index += 1
-            continue
-
-        segment_power = power[index:candidate_end + 1]
-        average_power = float(np.mean(segment_power))
-        power_cv = float(np.std(segment_power) / average_power) if average_power > 0 else np.inf
-        if power_cv <= max_power_cv:
+    def finish():
+        if start is None:
+            return
+        total_distance = distance[last_up] - distance[start]
+        grade = (elevation[last_up] - elevation[start]) / max(total_distance, 1)
+        if total_distance >= minimum_distance_m and grade > minimum_grade:
+            weights = df['analysis_dt'].to_numpy()[start + 1:last_up + 1]
+            average_power = np.average(power[start + 1:last_up + 1], weights=weights)
             climbs.append({
-                'start_index': index,
-                'end_index': candidate_end,
+                'start_index': start,
+                'end_index': last_up,
                 'distance_km': total_distance / 1000,
                 'grade': grade,
                 'average_power': round(average_power),
             })
-            index = candidate_end + 1
-        else:
-            index += 1
+    for index in range(1, len(df)):
+        if not df['valid_interval'].iloc[index]:
+            finish()
+            start = None
+            continue
+        rising = elevation[index] > elevation[index - 1] + 1e-8
+        gap_end = index - 1 if rising else index
+        if start is not None and distance[gap_end] - distance[last_up] > 100 + 1e-8:
+            finish()
+            start = None
+        if rising:
+            if start is None:
+                start = index - 1
+            last_up = index
+    finish()
     return climbs
 
 uploaded_file = st.file_uploader("Upload your FIT file", type="fit")
 
 if uploaded_file is not None:
     contents = uploaded_file.getvalue()
-    df = read_upload(contents)
+    try:
+        df = process_upload(contents, smoothing_m, speed_smooth_s)
+    except ValueError as error:
+        st.error(str(error))
+        st.stop()
+    if not df['valid_interval'].any():
+        st.error('No usable speed/elevation intervals of 5 seconds or less.')
+        st.stop()
     
     # --- DEFINE THIS EARLY AND SAFELY ---
     # We check if 'power' is a column AND if it contains any non-zero/non-null data
@@ -99,25 +106,18 @@ if uploaded_file is not None:
     # ------------------------------------
 
     # 1. CORE DATA CALCULATIONS (Fixes the KeyError)
-    df['speed_smoothed'] = df['speed'].rolling(window=speed_smooth_s, center=True, min_periods=1).mean()
-    df['dist_delta'] = df['speed_smoothed'] * df['dt']
-    df['cum_dist_km'] = df['dist_delta'].cumsum() / 1000.0
 
     # 2. ELEVATION SMOOTHING
-    avg_speed = df['speed_smoothed'].mean() if df['speed_smoothed'].mean() > 0 else 5
-    rows_in_window = max(int(smoothing_m / avg_speed), 5) 
-    df['ele_smoothed'] = df['ele'].rolling(window=rows_in_window, center=True, min_periods=1).mean()
 
     # 3. PHYSICS ENGINE
     physics = CyclingPhysics(my_mass, my_cda, my_crr)
     v = df['speed_smoothed'].values
     ele_array = df['ele_smoothed'].values
-    dt = df['dt'].values
-    cadence = df['cad'].values if 'cad' in df.columns else np.ones(len(df)) * 90
+    dt = df['analysis_dt'].to_numpy()
+    cadence = df['cad'].fillna(90).to_numpy()
     
-    ele_diff = np.diff(ele_array, prepend=ele_array[0])
-    distance_delta = np.maximum(0, (v + np.roll(v, 1)) / 2 * dt)
-    distance_delta[0] = 0
+    ele_diff = df['elevation_delta'].to_numpy()
+    distance_delta = df['dist_delta'].to_numpy()
     
     powers = physics.estimate_series(v, ele_diff, distance_delta, dt, cadence)
 
@@ -130,17 +130,20 @@ if uploaded_file is not None:
     high_power = CyclingPhysics(my_mass, cda_range[1], crr_range[1]).estimate_series(
         v, ele_diff, distance_delta, dt, cadence
     )
-    valid_power = np.isfinite(powers) & (powers > 0)
+    valid_power = np.isfinite(powers) & (dt > 0)
+    if has_real_power:
+        valid_power &= df['real_power'].notna().to_numpy()
+    weights = dt[valid_power]
     low_delta = low_power[valid_power] - powers[valid_power]
     high_delta = high_power[valid_power] - powers[valid_power]
 
     uncertainty_w = None
     if has_real_power:
-        measured_power = df['real_power'].interpolate(limit_direction='both').to_numpy()
+        measured_power = df['real_power'].to_numpy()
         measured_filtered = lowpass_power(measured_power, dt)
         estimated_filtered = lowpass_power(df['p_guessed'].to_numpy(), dt)
         residual = estimated_filtered - measured_filtered
-        valid_residual = residual[np.isfinite(residual) & (measured_filtered > 0)]
+        valid_residual = residual[np.isfinite(residual) & valid_power]
         if len(valid_residual):
             uncertainty_w = float(np.percentile(np.abs(valid_residual), 75))
 
@@ -193,13 +196,16 @@ if uploaded_file is not None:
             hide_index=True,
         )
     else:
-        st.info("No climbs of at least 1 km at 3% average grade with steady power were found.")
+        st.info('No climbs of at least 1 km above 3% average grade were found (maximum flat/downhill gap: 100 m).')
 
     if optimize_clicked:
         if not has_real_power:
             st.sidebar.warning("Upload a FIT file containing real power first.")
         else:
-            measured_power = df['real_power'].interpolate(limit_direction='both').to_numpy()
+            measured_power = df['real_power'].to_numpy()
+            if np.count_nonzero(np.isfinite(measured_power) & (dt > 0)) < 30:
+                st.warning('Calibration needs at least 30 valid measured-power intervals.')
+                st.stop()
             optimized, uncertainty, _, _ = optimize_parameters(
                 [my_mass, my_cda, my_crr],
                 measured_power,
@@ -213,18 +219,19 @@ if uploaded_file is not None:
             st.sidebar.write({
                 "Mass (kg, fixed)": round(optimized[0], 2),
                 "CdA": f"{optimized[1]:.4f} ± {uncertainty[0]:.4f}",
-                "Crr": f"{optimized[2]:.5f} ± {uncertainty[1]:.5f}",
+                "Crr (fixed)": f"{optimized[2]:.3f}",
             })
             st.sidebar.caption("± ranges correspond to approximately ±5 W average modeled power.")
+            st.sidebar.caption('Use the suggested CdA together with Crr = 0.003 in the sidebar. Calibrate using solo rides with varied speeds.')
 
     # 4. DASHBOARD METRICS
     col1, col2, col3, col4, col5 = st.columns(5)
     
     # Calculate averages safely
-    avg_guessed = df['p_guessed'].mean()
+    avg_guessed = float(np.average(powers[valid_power], weights=weights)) if valid_power.any() else 0
     if valid_power.any():
-        average_low_delta = float(np.mean(low_delta))
-        average_high_delta = float(np.mean(high_delta))
+        average_low_delta = float(np.average(low_delta, weights=weights))
+        average_high_delta = float(np.average(high_delta, weights=weights))
         uncertainty_label = f"{average_low_delta:+.0f} / {average_high_delta:+.0f} W"
         col1.metric("Estimated Avg", f"{avg_guessed:.0f} W", delta=uncertainty_label, delta_color="off")
     else:
@@ -232,7 +239,7 @@ if uploaded_file is not None:
     
     if has_real_power:
         # Using .mean() on real_power automatically ignores NaNs (missing data)
-        avg_real = df['real_power'].mean()
+        avg_real = float(np.average(df['real_power'].to_numpy()[valid_power], weights=weights)) if valid_power.any() else 0
         diff = avg_guessed - avg_real
         
         col2.metric(
@@ -253,7 +260,7 @@ if uploaded_file is not None:
         col5.metric("Avg HR", "N/A")
 
     if uncertainty_w is not None:
-        with st.expander("Power uncertainty analysis"):
+        with st.expander("Measured-power validation"):
             uncertainty_col1, uncertainty_col2, uncertainty_col3 = st.columns(3)
             uncertainty_col1.metric("MAE", f"{np.mean(np.abs(valid_residual)):.0f} W")
             uncertainty_col2.metric("Bias", f"{np.mean(valid_residual):+.0f} W")
@@ -262,15 +269,15 @@ if uploaded_file is not None:
 
     with st.expander("Road-bike parameter uncertainty"):
         if valid_power.any():
-            low_average = float(np.mean(low_delta))
-            high_average = float(np.mean(high_delta))
+            low_average = float(np.average(low_delta, weights=weights))
+            high_average = float(np.average(high_delta, weights=weights))
             low_p75 = -float(np.percentile(np.abs(low_delta), 75))
             high_p75 = float(np.percentile(np.abs(high_delta), 75))
             st.write(f"Relative ranges: CdA ±20% ({cda_range[0]:.3f}–{cda_range[1]:.3f} m²), Crr ±10% ({crr_range[0]:.4f}–{crr_range[1]:.4f}).")
             range_col1, range_col2 = st.columns(2)
             range_col1.metric("Average power range", f"{low_average:+.0f} / {high_average:+.0f} W")
             range_col2.metric("75th-percentile range", f"{low_p75:+.0f} / {high_p75:+.0f} W")
-            st.caption("The first value is the low-end change and the second is the high-end change for 75% of samples.")
+            st.caption('Parameter sensitivity only: excludes wind, drafting, elevation error and braking. Average bounds use the same time weights as Estimated Avg; percentiles describe individual samples.')
         else:
             st.info("No moving samples are available for uncertainty analysis.")
 
@@ -349,6 +356,11 @@ if uploaded_file is not None:
         tooltip=['Zone:N', alt.Tooltip('Time (minutes):Q', format='.1f')],
     ).properties(title=f'Power zones based on FTP = {ftp} W').interactive()
     st.altair_chart(chart, use_container_width=True)
+
+    with st.expander('Data quality and processing'):
+        st.write(df.attrs.get('quality', {}))
+        st.caption('Smoothing is confined to continuous valid data. Elevation uses distance; speed uses time. Averages include zeros and exclude gaps over 5 s. Measured-power comparisons use matching samples. Distance excludes unobserved gaps.')
+        st.line_chart(df[['cum_dist_km', 'ele', 'ele_smoothed']].iloc[::sample_rate].set_index('cum_dist_km'))
 
     with st.expander("🔍 Inspect FIT File Channels (Columns)"):
         st.write(f"**Found {len(df.columns)} channels:**")
